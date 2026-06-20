@@ -18,7 +18,16 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
+import json
+import os
+import re
+
+from dotenv import load_dotenv
+from groq import Groq
+
 from tools import search_listings, suggest_outfit, create_fit_card
+
+load_dotenv()
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -92,9 +101,100 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     Before writing code, complete the Planning Loop and State Management sections
     of planning.md — your implementation should match what you described there.
     """
-    # TODO: implement the planning loop
+    # Step 1: Initialize the session
     session = _new_session(query, wardrobe)
-    session["error"] = "Planning loop not yet implemented."
+
+    # Step 2: Parse the user's query to extract description, size, and max_price
+    def parse_query():
+        def regex_fallback():
+            price_match = re.search(r"under\s+\$?(\d+(?:\.\d+)?)", query, re.IGNORECASE)
+            size_match = re.search(
+                r"\b(XXS|XS|S/M|M/L|L/XL|S|M|L|XL|XXL|W\d{2}(?:\s+L\d{2})?|US\s*\d+(?:\.\d+)?)\b",
+                query, re.IGNORECASE,
+            )
+            desc = query
+            if price_match:
+                desc = desc[: price_match.start()] + desc[price_match.end() :]
+            if size_match:
+                desc = desc[: size_match.start()] + desc[size_match.end() :]
+            for filler in ["i'm looking for", "looking for", "i want", "find me", "size", "under"]:
+                desc = re.sub(filler, "", desc, flags=re.IGNORECASE)
+            desc = " ".join(desc.split()).strip(" ,.")
+            return {
+                "description": desc or query,
+                "size": size_match.group(1).strip() if size_match else None,
+                "max_price": float(price_match.group(1)) if price_match else None,
+            }
+
+        api_key = os.environ.get("GROQ_API_KEY")
+        if not api_key:
+            return regex_fallback()
+        try:
+            client = Groq(api_key=api_key)
+            system_prompt = (
+                "You are a query parser for a secondhand clothing search engine. "
+                "Extract three fields and respond ONLY with a valid JSON object — no explanation, no markdown.\n\n"
+                'Format: {"description": "string", "size": "string or null", "max_price": number_or_null}\n\n'
+                "- description: clothing item and style keywords, strip size and price mentions.\n"
+                "- size: size string if mentioned (e.g. 'M', 'S/M', 'W30'), else null.\n"
+                "- max_price: maximum price as a number if mentioned, else null."
+            )
+            response = client.chat.completions.create(
+                model="llama-3.3-70b-versatile",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": query},
+                ],
+                max_tokens=100,
+                temperature=0.0,
+            )
+            raw = re.sub(r"```(?:json)?", "", response.choices[0].message.content.strip()).strip("`").strip()
+            parsed = json.loads(raw)
+            return {
+                "description": str(parsed.get("description") or query),
+                "size": str(parsed["size"]) if parsed.get("size") else None,
+                "max_price": float(parsed["max_price"]) if parsed.get("max_price") else None,
+            }
+        except Exception:
+            return regex_fallback()
+
+    session["parsed"] = parse_query()
+
+    # Step 3: Call search_listings() with the parsed parameters
+    results = search_listings(
+        description=session["parsed"]["description"],
+        size=session["parsed"].get("size"),
+        max_price=session["parsed"].get("max_price"),
+    )
+    session["search_results"] = results
+
+    # If no results: set error and return early — do NOT proceed to suggest_outfit
+    if not results:
+        size_note = f" in size {session['parsed']['size']}" if session["parsed"].get("size") else ""
+        price_note = f" under ${session['parsed']['max_price']:.0f}" if session["parsed"].get("max_price") else ""
+        session["error"] = (
+            f"No listings found matching \"{session['parsed']['description']}\"{size_note}{price_note}. "
+            "Try broadening your search — remove the size filter, raise your price ceiling, "
+            "or use different keywords (e.g. 'denim jacket' instead of 'jean coat')."
+        )
+        return session
+
+    # Step 4: Select the top result
+    session["selected_item"] = results[0]
+
+    # Step 5: Call suggest_outfit() with the selected item and wardrobe
+    session["outfit_suggestion"] = suggest_outfit(
+        new_item=session["selected_item"],
+        wardrobe=session["wardrobe"],
+    )
+
+    # Step 6: Call create_fit_card() with the outfit suggestion and selected item
+    session["fit_card"] = create_fit_card(
+        outfit=session["outfit_suggestion"],
+        new_item=session["selected_item"],
+    )
+
+    # Step 7: Return the session
     return session
 
 
